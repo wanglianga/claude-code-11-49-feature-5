@@ -50,4 +50,14 @@ public class SourceIdentity {
 
     @Column(nullable = false)
     public Instant createdAt = Instant.now();
+
+    /** 首次接入该身份的文件批次（渐进式接入溯源） */
+    public java.util.UUID firstBatchId;
+
+    /** 最近一次补充/更新该身份字段的批次 */
+    public java.util.UUID lastBatchId;
+
+    /** 接入时的字段契约版本（legacy-v1 / enriched-v2 ...），记录"当时能看到什么" */
+    @Column(length = 32)
+    public String contractVersionAtIngest;
 }

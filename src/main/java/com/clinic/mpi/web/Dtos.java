@@ -6,6 +6,7 @@ import jakarta.validation.constraints.NotNull;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /** API 请求 DTO。 */
@@ -86,5 +87,23 @@ public final class Dtos {
             UUID identityId,
             UUID masterId,
             long graphVersion) {
+    }
+
+    public record BatchUploadRequest(
+            String batchCode,
+            @NotBlank String sourceSystem,
+            String fileName,
+            String contractVersion,
+            String repairOfBatchCode,
+            @NotNull List<String> columns,
+            @NotNull List<Map<String, String>> rows) {
+    }
+
+    public record StagingPublishRequest(
+            @NotNull Long expectedGraphVersion,
+            String reason) {
+    }
+
+    public record StagingRevokeRequest(String reason) {
     }
 }

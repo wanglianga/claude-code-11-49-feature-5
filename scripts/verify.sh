@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 验收回放脚本：多院重复挂号合并、误并拆分、并发决议、来源证件更正、关账后调整
+# 验收回放脚本：多院重复挂号合并、误并拆分、并发决议、来源证件更正、关账后调整、
+# 渐进式来源接入（批次覆盖/稳定性/暂存隔离）
 # 前置条件：服务已启动且为全新播种数据（图谱版本 = 0）。重置方式见 README。
 set -euo pipefail
 
@@ -17,7 +18,7 @@ check_ne(){ # check_ne <描述> <实际> <不应等于>
   if [ "$2" != "$3" ]; then ok "$1"; else bad "$1（不应等于 $3）"; fi
 }
 
-get(){ curl -s "$BASE$1"; }
+get(){ curl -s --retry 3 --retry-all-errors --retry-delay 1 "$BASE$1"; }
 post(){ # post <path> <json> <operator>
   curl -s -X POST "$BASE$1" -H 'Content-Type: application/json' \
        -H "X-Operator-Id: ${3:-system}" -d "${2:-{}}"
@@ -197,6 +198,127 @@ check "v0 时赵六检验身份为单例主体" "$(get "/api/resolve?sourceSyste
 check "当前版本赵六三身份同主体" "$(resolve_master SETTLE_A S-A-001)" "$M6"
 check "决议链完整（4 合并 + 1 拆分）" "$(get /api/resolutions | jq '[.[] | select(.type=="MERGE")] | length')" "4"
 check "拆分决议数" "$(get /api/resolutions | jq '[.[] | select(.type=="SPLIT")] | length')" "1"
+
+echo
+echo "【场景6】渐进式来源接入：简写姓名首批 → 补充出生年月 → 稳定性与暂存隔离"
+SRC=CLINIC_X
+# 锚点：三要素齐全的正式身份（供补充批次强证据自动链接）
+post /api/source-identities \
+  '{"sourceSystem":"CLINIC_X","sourcePatientId":"ANCHOR-1","fullName":"张三","phone":"13955550001","gender":"M","birthDate":"1990-01-01"}' >/dev/null
+
+# 6.1 首批：旧病历只有病历号+简写姓名（中文列名别名），无出生年月
+B1JSON=$(jq -n --arg s "$SRC" '{sourceSystem:$s,fileName:"legacy.csv",contractVersion:"legacy-v1",
+  columns:["病历号","姓名","性别"],
+  rows:[{"病历号":"MRN-B1","姓名":"张","性别":"M"},{"病历号":"MRN-B2","姓名":"李","性别":"M"}]}')
+B1=$(post /api/batches "$B1JSON"); B1ID=$(echo "$B1" | jq -r .id)
+check "首批状态 ACCEPTED（保守门槛，无自动链接）" "$(echo "$B1" | jq -r .status)" "ACCEPTED"
+check "首批可确定链接=0" "$(echo "$B1" | jq -r .confirmedCount)" "0"
+check "首批证据不足暂不链接=2" "$(echo "$B1" | jq -r .insufficientCount)" "2"
+check "首批暂存记录数=2" "$(echo "$B1" | jq -r .stagedCount)" "2"
+check "首批出生年月覆盖率 0%" "$(echo "$B1" | jq -r '.fieldCoverageJson|fromjson|.birthDate.coverageRate')" "0"
+check "首批 MRN-B1 决策 INSUFFICIENT_STAGED" \
+  "$(get "/api/batches/$B1ID/records" | jq -r '.[]|select(.sourcePatientId=="MRN-B1")|.decision')" "INSUFFICIENT_STAGED"
+check "受限工作区有 2 条生效暂存" \
+  "$(get /api/staging/active | jq --arg s "$SRC" '[.[]|select(.sourceSystem==$s)]|length')" "2"
+# 中文关键字经 @uri 编码，避免未编码字符被容器判 400
+KW=$(jq -rn --arg x 张 '$x|@uri')
+check "受限查询强制范围提示 RESTRICTED_QUERY_ONLY" \
+  "$(get "/api/staging/restricted-query?sourceSystem=$SRC&nameKeyword=$KW" | jq -r '.[0].scope')" "RESTRICTED_QUERY_ONLY"
+check "受限查询强制临时性警告" \
+  "$(get "/api/staging/restricted-query?sourceSystem=$SRC&nameKeyword=$KW" | jq -r '.[0].warning|contains("不得用于结算")')" "true"
+
+# 6.2 同文件重传：指纹幂等
+B1DUP=$(post /api/batches "$B1JSON")
+check "同指纹重传返回同一批次" "$(echo "$B1DUP" | jq -r .id)" "$B1ID"
+check "重传次数累计为 1" "$(echo "$B1DUP" | jq -r .reuploadCount)" "1"
+
+# 6.3 第二批补齐出生年月：MRN-B1 与锚点三要素一致 → UPGRADED；MRN-B2 无候选 → STABLE
+B2JSON=$(jq -n --arg s "$SRC" '{sourceSystem:$s,fileName:"enriched.csv",contractVersion:"enriched-v2",
+  columns:["病历号","姓名","手机号","性别","出生年月"],
+  rows:[{"病历号":"MRN-B1","姓名":"张三","手机号":"13955550001","性别":"M","出生年月":"1990-01-01"},
+        {"病历号":"MRN-B2","姓名":"李四","手机号":"13955550002","性别":"M","出生年月":"1985-05-05"}]}')
+B2=$(post /api/batches "$B2JSON"); B2ID=$(echo "$B2" | jq -r .id)
+check "补充批次状态 ACCEPTED" "$(echo "$B2" | jq -r .status)" "ACCEPTED"
+check "MRN-B1 稳定性 UPGRADED（暂存升级正式关联）" \
+  "$(get "/api/batches/$B2ID/stability" | jq -r '.[]|select(.sourcePatientId=="MRN-B1")|.verdict')" "UPGRADED"
+check "MRN-B2 稳定性 STABLE（首批决策不被回溯）" \
+  "$(get "/api/batches/$B2ID/stability" | jq -r '.[]|select(.sourcePatientId=="MRN-B2")|.verdict')" "STABLE"
+check "首批报告不被回溯改写（仍 2 条暂不链接）" \
+  "$(get "/api/batches/$B1ID" | jq -r .insufficientCount)" "2"
+check "补充后仅 MRN-B2 仍处暂存" \
+  "$(get /api/staging/active | jq --arg s "$SRC" '[.[]|select(.sourceSystem==$s)]|length')" "1"
+check "批次比较接口输出三类比例" \
+  "$(get "/api/batches/compare?batchAId=$B1ID&batchBId=$B2ID" | jq -r '.batchA.confirmedLink // "x"')" "0"
+
+# 6.4 列名漂移：受限待修复，不沿用旧解析器放行
+DRIFT=$(post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"legacy-v1",
+  columns:["old_mrn","病人简写"],rows:[{"old_mrn":"DRIFT-1","病人简写":"赵"}]}')")
+check "列名漂移批次 RESTRICTED" "$(echo "$DRIFT" | jq -r .status)" "RESTRICTED"
+check "质量问题含 CONTRACT_DRIFT" "$(echo "$DRIFT" | jq -r '.qualityIssuesJson|contains("CONTRACT_DRIFT")')" "true"
+check "漂移记录未产生身份" \
+  "$(get /api/source-identities | jq -r '[.[]|select(.sourcePatientId=="DRIFT-1")]|length')" "0"
+# 修复后新指纹重传，登记修复关系
+FIXED=$(post /api/batches "$(jq -n --arg s "$SRC" --arg code "$(echo "$DRIFT"|jq -r .batchCode)" \
+  '{sourceSystem:$s,contractVersion:"legacy-v1",repairOfBatchCode:$code,
+    columns:["病历号","姓名"],rows:[{"病历号":"DRIFT-1","姓名":"赵"}]}')")
+check "修复重传 ACCEPTED 且登记 repairOfBatchId" \
+  "$(echo "$FIXED" | jq -r '.status + "|" + (.repairOfBatchId!=null|tostring)')" "ACCEPTED|true"
+
+# 6.5 出生年月批量缺失（enriched-v2 三行空两行）：受限，不以空值填补
+MISS=$(post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"enriched-v2",
+  columns:["病历号","姓名","出生年月"],
+  rows:[{"病历号":"M-1","姓名":"孙一","出生年月":""},
+        {"病历号":"M-2","姓名":"孙二","出生年月":""},
+        {"病历号":"M-3","姓名":"孙三","出生年月":"1990-01-01"}]}')")
+check "批量缺失批次 RESTRICTED" "$(echo "$MISS" | jq -r .status)" "RESTRICTED"
+check "质量问题含 MISSING_BATCH_FIELD" "$(echo "$MISS" | jq -r '.qualityIssuesJson|contains("MISSING_BATCH_FIELD")')" "true"
+
+# 6.6 更正日志与首批矛盾：受限，不静默覆盖首批事实
+post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"legacy-v1",
+  columns:["病历号","姓名","证件号"],
+  rows:[{"病历号":"CONTR-1","姓名":"吴九","证件号":"110101197703031111"}]}')" >/dev/null
+CONTR=$(post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"legacy-v1",
+  columns:["病历号","姓名","证件号"],
+  rows:[{"病历号":"CONTR-1","姓名":"吴九","证件号":"110101197703031112"}]}')")
+check "更正矛盾批次 RESTRICTED" "$(echo "$CONTR" | jq -r .status)" "RESTRICTED"
+check "质量问题含 CORRECTION_CONTRADICTION" "$(echo "$CONTR" | jq -r '.qualityIssuesJson|contains("CORRECTION_CONTRADICTION")')" "true"
+check "首批证件号事实未被覆盖" \
+  "$(get /api/source-identities | jq -r '.[]|select(.sourcePatientId=="CONTR-1")|.idCardNo')" "110101197703031111"
+
+# 6.7 补充资料推翻早期弱候选
+post /api/source-identities \
+  '{"sourceSystem":"CLINIC_X","sourcePatientId":"W-ANCHOR","fullName":"王五","phone":"13700007777","gender":"M","birthDate":"1985-05-05"}' >/dev/null
+W1=$(post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"legacy-v1",
+  columns:["病历号","姓名","手机号","性别"],
+  rows:[{"病历号":"W-1","姓名":"王","手机号":"13700007777","性别":"M"}]}')")
+check "首批弱证据仅人工审阅（无自动链接资格）" \
+  "$(get "/api/batches/$(echo "$W1"|jq -r .id)/records" | jq -r '.[]|select(.sourcePatientId=="W-1")|.decision')" "MANUAL_REVIEW"
+WPID=$(get "/api/batches/$(echo "$W1"|jq -r .id)/records" | jq -r '.[]|select(.sourcePatientId=="W-1")|.candidatePairId')
+check "弱候选 autoLinkEligible=false" "$(get "/api/candidates/$WPID" | jq -r .autoLinkEligible)" "false"
+W2=$(post /api/batches "$(jq -n --arg s "$SRC" '{sourceSystem:$s,contractVersion:"enriched-v2",
+  columns:["病历号","姓名","手机号","性别","出生年月"],
+  rows:[{"病历号":"W-1","姓名":"王","手机号":"13700007777","性别":"M","出生年月":"1992-02-02"}]}')")
+check "补充矛盾出生年月 → 稳定性 OVERTURNED" \
+  "$(get "/api/batches/$(echo "$W2"|jq -r .id)/stability" | jq -r '.[0].verdict')" "OVERTURNED"
+check "被推翻候选状态 SUPERSEDED" "$(get "/api/candidates/$WPID" | jq -r .status)" "SUPERSEDED"
+
+# 6.8 暂存隔离：弱证据不能发布为正式关联，且不流入快照/预约
+SID=$(get /api/staging/active | jq -r --arg s "$SRC" '.[]|select(.sourceSystem==$s and .sourcePatientId=="MRN-B2")|.id')
+V=$(version)
+CODE=$(post_status "/api/staging/$SID/publish" "{\"expectedGraphVersion\":$V}" "$OP1")
+check "无强证据发布暂存被拒（409）" "$CODE" "409"
+SNAP=$(post /api/snapshots '{"businessType":"APPOINTMENT","label":"批次隔离验证快照"}' "$OP1")
+SNAPID=$(echo "$SNAP" | jq -r .id)
+FORMAL=$(get "/api/staging/active" | jq -r --arg s "$SRC" '.[]|select(.id=="'$SID'")|.formalMasterId')
+check "正式快照可解析暂存身份（取正式主体，不取临时猜测）" \
+  "$(get "/api/snapshots/$SNAPID/resolve?sourceSystem=$SRC&sourcePatientId=MRN-B2" | jq -r .masterId)" "$FORMAL"
+check "快照物化数等于正式身份总数（无暂存专有映射）" \
+  "$(get "/api/snapshots/$SNAPID/mappings" | jq 'length')" "$(get /api/source-identities | jq 'length')"
+APPT=$(post /api/biz/appointments \
+  "$(jq -n --arg snap "$SNAPID" --arg s "$SRC" '{snapshotId:$snap,sourceSystem:$s,sourcePatientId:"MRN-B2",apptTime:"2026-12-01T09:00:00Z"}')")
+check "预约经正式快照建单，归属正式主体" "$(echo "$APPT" | jq -r .masterId)" "$FORMAL"
+check "暂存仍为 ACTIVE，未流入任何正式业务表" \
+  "$(get "/api/staging/active" | jq -r --arg id "$SID" '[.[]|select(.id==$id)]|length')" "1"
 
 echo
 echo "=========================================================="

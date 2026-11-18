@@ -1,8 +1,0 @@
-spring:
-  datasource:
-    url: jdbc:postgresql://${DB_HOST:127.0.0.1}:${DB_PORT:5432}/${DB_TEST_NAME:ccdev_test}
-    username: ${DB_USER:ccdev}
-    password: ${DB_PASS:ccdev}
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
